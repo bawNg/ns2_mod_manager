@@ -1,6 +1,8 @@
-Script.Load("lua/compress/deflatelua.lua")
-Script.Load("lua/untar.lua")
 Script.Load("lua/md5.lua")
+
+local kMaxConcurrentModDownloads = 8
+local kMaxModDownloadAttempts = 20
+local kServerUserAgent = string.format("NS2 Server: %s:%d", IPAddressToString(Server.GetIpAddress()), Server.GetPort())
 
 local kMaxModDownloadUrlLength = 256
 local kMaxModDirNameLength = 128
@@ -36,6 +38,44 @@ end
 function Client.FinishedLoading()
     -- Tell the engine that Lua is done loading mods
 end
+
+function Server.AcceptClientConnections(acceptConnections)
+    -- AcceptClientConnections(false) tells the server to not accept client connections until AcceptClientConnections(true) is called
+end
+
+function Shared.ModMissingError(errorMessage)
+    -- Tell the engine that there was an error loading one or more mods
+end
+
+function Shared.SendHTTPRequest(table)
+    -- Make a HTTP request with optionally specified headers and an error callback called if the request fails
+    -- Default request options if not given: method = "GET", data = { }, header = { }
+    -- Callback arguments for onSuccess and onError: (body, responseHeader, code)
+    -----------------------------------------------------------------------------
+    -- Example usage:
+    -----------------------------------------------------------------------------
+    -- Shared.SendHTTPRequest {
+    --   method = "POST",
+    --   url = kUploadFileUrl,
+    --   data = { name = "example.txt", content = fileContent },
+    --   header = { ["User-Agent"] = string.format("NS2 Server: %s:%d", IPAddressToString(Server.GetIpAddress()), Server.GetPort()) },
+    --   onSuccess = function(data, header, code)
+    --      Shared.Message("File upload successful!")
+    --   end,
+    --   onError = function(data, header, code)
+    --      Shared.Message("Uploading file failed! Response code: " .. code)
+    --   end
+    -- }
+end
+
+function Shared.CreateZip(dirPath, zipFile, callback)
+    -- Create a zip archive containing the specified directory
+end
+
+function Shared.ExtractZip(zipFile, destinationPath, callback)
+    -- Extract the specified zip archive contents to the destination path
+    -- Callback arguments: suceeded
+end
 ------------------------------------------------------
 
 function Shared.GetDirHash(path)
@@ -66,9 +106,9 @@ local downloadUrl
 
 local totalMods = 0
 local waitingForMods = 0
-local queuedMods = 0
-local downloadingMods = 0
 
+local queuedMods = { }
+local downloadingMods = { }
 local modInfo = { }
 
 ModManager = { }
@@ -84,11 +124,11 @@ function ModManager.LoadMod(dirName)
             
             Shared.MountModDir(dirName)
 
-            queuedMods = queuedMods - 1
-
-            if waitingForMods + queuedMods == 0 then
+            if waitingForMods + #queuedMods == 0 then
                 Shared.Message("[ModManager] All mods have been loaded successfully")
                 ModManager.OnLoadingComplete()
+            else
+                ModManager.DownloadNextQueuedMod()
             end
         else
             Shared.Message("[ModManager] Invalid mod directory: " .. dirName)
@@ -99,43 +139,81 @@ function ModManager.LoadMod(dirName)
     end
 end
 
+function ModManager.QueueMod(dirName)
+    if #downloadingMods < kMaxConcurrentModDownloads then
+        ModManager.DownloadMod(dirName)
+    else
+        table.insert(queuedMods, message.dirName)
+    end
+end
+
+function ModManager.DownloadNextQueuedMod()
+    if #queuedMods == 0 then
+        return false
+    end
+
+    local dirName = table.remove(queuedMods, 1)
+    ModManager.DownloadMod(dirName)
+
+    return true
+end
+
 function ModManager.DownloadMod(dirName)
-    downloadingMods = downloadingMods + 1
+    if modInfo[dirName].attempts >= kMaxModDownloadAttempts then
+        Shared.ModMissingError("Failed to download mod: " .. dirName)
+        return
+    end
 
-    local modDownloadUrl = string.format("%s/%s.tar.gz", ModManager.downloadUrl, dirName)
+    table.insert(downloadingMods, dirName)
 
-    Shared.Message("[ModManager] Downloading mod: " .. modDownloadUrl)
+    modInfo[dirName].attempts = modInfo[dirName].attempts + 1
 
-    Shared.SendHTTPRequest(modDownloadUrl, "GET", function(archiveContents)
+    local modDownloadUrl = string.format("%s/%s.zip", ModManager.downloadUrl, dirName)
 
-        downloadingMods = downloadingMods - 1
-        
-        local tarFilePath = string.format("config://mods/%s.tar", dirName)
-        local tarFile = io.open(tarFilePath, "wb")
+    Shared.Message(string.format("[ModManager] Downloading mod: %s (attempt: %d)", modDownloadUrl, modInfo[dirName].attempts))
 
-        Shared.Message("[ModManager] Decompressing mod: " .. dirName)
+    --TODO: download mods in multiple parts using header support, track progress and retry parts on failure instead of entire mod
+    Shared.SendHTTPRequest {
+        url = modDownloadUrl,
+        header = { ["User-Agent"] = kServerUserAgent },
 
-        local startedAt = Shared.GetTime()
+        onSuccess = function(archiveContents)
+            local zipFilePath = string.format("config://mods/%s.zip", dirName)
+            local zipFile = io.open(tarFilePath, "wb")
 
-        deflatelua.gunzip { input = archiveContents, output = tarFile, disable_crc = true }
+            zipFile:write(archiveContents)
 
-        io.close(tarFile)
+            io.close(zipFile)
 
-        Shared.Message(string.format("[ModManager] Mod decompression complete: %s (took: %.2f seconds)", dirName, Shared.GetTime() - startedAt))
+            Shared.Message("[ModManager] Extracting mod: " .. dirName)
 
-        Shared.Message("[ModManager] Extracting mod: " .. dirName)
+            local startedAt = Shared.GetTime()
 
-        startedAt = Shared.GetTime()
+            Shared.ExtractZip(zipFilePath, "config://mods", function(succeeded)
 
-        if Shared.Untar(tarFilePath, "config://mods/" .. dirName) then
-            Shared.Message(string.format("[ModManager] Mod extraction complete: %s (took: %.2f seconds)", dirName, Shared.GetTime() - startedAt))
-        else
-            Shared.Message("[ModManager] Mod extraction failed: " .. dirName)
+                table.removevalue(downloadingMods, dirName)
+
+                if succeeded then
+                    Shared.Message(string.format("[ModManager] Mod extraction complete: %s (took: %.2f seconds)", dirName, Shared.GetTime() - startedAt))
+
+                    ModManager.LoadMod(dirName)
+                else
+                    Shared.Message(string.format("[ModManager] Mod extraction failed: %s (requeuing mod)", dirName))
+
+                    ModManager.QueueMod(dirName)
+                end
+
+            end)
+        end,
+
+        onError = function(body, header, code)
+            Shared.Message(string.format("[ModManager] Mod download attempt %d failed: %s (response code: %d)", modInfo[dirName].attempts, dirName, code))
+
+            table.removevalue(downloadingMods, dirName)
+
+            ModManager.QueueMod(dirName)
         end
-
-        ModManager.LoadMod(dirName)
-
-    end)
+    }
 end
 
 if Server then
@@ -152,6 +230,8 @@ if Server then
 
     local function OnMapPreLoad()
         if not enabled then return end
+
+        Server.AcceptClientConnections(false)
 
         local mapName = Shared.GetCurrentMap()
         local mods = { }
@@ -186,7 +266,7 @@ if Server then
                 end
             end
 
-            modInfo[dirName] = { hash = Shared.GetDirHash("config://mods/" .. dirName), name = name }
+            modInfo[dirName] = { hash = Shared.GetDirHash("config://mods/" .. dirName), name = name, attempts = 0 }
 
             ModManager.LoadMod(dirName)
         end
@@ -219,9 +299,7 @@ if Server then
     Event.Hook("ClientDisconnect", OnClientDisconnect)
 
     function ModManager.OnLoadingComplete()
-        for user_id, client in pairs(connectedUserIds) do
-            OnClientConnect(client)
-        end
+        Server.AcceptClientConnections(true)
     end
 
 elseif Client then
@@ -244,10 +322,11 @@ elseif Client then
 
         table.insert(modDirNames, message.dirName)
 
-        modInfo[message.dirName] = { hash = message.hash, name = message.name }
+        modInfo[message.dirName] = { hash = message.hash, name = message.name, attempts = 0 }
 
         waitingForMods = waitingForMods - 1
-        queuedMods = queuedMods + 1
+        
+        ModManager.QueueMod(message.dirName)
     end
 
     Client.HookNetworkMessage("SetModInfo", OnSetModInfo)
